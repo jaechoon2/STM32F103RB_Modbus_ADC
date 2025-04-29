@@ -18,12 +18,17 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "modbus.h" // modbus.h 포함 확인
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,23 +47,52 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-ADC_HandleTypeDef hadc1;
-
-UART_HandleTypeDef huart1;
-UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+#define SLAVE_ADDRESS 0x01
+#define MODBUS_BUFFER_SIZE 256
+
+uint8_t ModbusReceiveBuffer[MODBUS_BUFFER_SIZE];
+uint8_t UART1_RxBuffer; // 1바이트 수신용 버퍼
+volatile uint16_t ModbusReceiveIndex = 0;
+volatile bool ModbusFrameReceived = false; // 프레임 수신 완료 플래그
+
+// ADC 관련 변수
+volatile uint16_t uwADCxConvertedValue[10]; // ADC 값 저장 (예: 10개)
+volatile uint16_t uwADCxConvertedVals; // 단일 변환 값 (필요시 사용)
+
+// 릴레이 GPIO 핀 정의 (가독성 향상)
+#define RELAY1_PORT GPIOC
+#define RELAY1_PIN GPIO_PIN_6
+#define RELAY2_PORT GPIOC
+#define RELAY2_PIN GPIO_PIN_7
+#define RELAY3_PORT GPIOC
+#define RELAY3_PIN GPIO_PIN_8
+#define RELAY4_PORT GPIOC
+#define RELAY4_PIN GPIO_PIN_9
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_ADC1_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+uint16_t ModbusCRC(uint8_t *buf, int len);
+void ProcessModbusPacket(uint8_t *buf, int len);
+uint16_t ReadHoldingRegister(uint16_t address);
+// WriteSingleRegister 함수의 반환 타입을 void로 변경
+void WriteSingleRegister(uint16_t address, uint16_t value);
 
+#define MODBUS_MAX_LEN  256
+#define MODBUS_SLAVE_ID 0x01
+
+uint8_t tx_buf[MODBUS_MAX_LEN];
+uint8_t rx_buf[MODBUS_MAX_LEN];
+
+uint8_t tx_data[] = "RS485 DMA Packet\r\n";
+uint8_t rx_buffer[64];
+
+uint8_t rx_data[64];
+uint8_t rx_buffer[64];
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -81,90 +115,72 @@ PUTCHAR_PROTOTYPE
     /* Place your implementation of fputc here */
     /* e.g. write a character to the USART1 and Loop until the end of transmission */
     if (ch == '\n') {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 1, 0xFFFF);
+        HAL_UART_Transmit(&huart3, (uint8_t*)"\r", 1, 0xFFFF);
     }
-    HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, 0xFFFF);
+    HAL_UART_Transmit(&huart3, (uint8_t*)&ch, 1, 0xFFFF);
 
     return ch;
 }
+// ... (printf 관련 코드 유지)
 
-#define SLAVE_ADDRESS 0x01
-#define EXPECTED_PACKET_LENGTH 8 //8  // 실제 패킷 길이에 맞게 설정
-#define MODBUS_BUFFER_SIZE 256
-
-uint8_t ModbusReceiveBuffer[MODBUS_BUFFER_SIZE];
-uint8_t UART1_RxBuffer;
-volatile uint16_t ModbusReceiveIndex = 0;
-volatile uint16_t uwADCxConvertedValue[11];
-volatile uint16_t uwADCxConvertedVals;
-
-uint16_t ModbusCRC(uint8_t *buf, int len);
-void ProcessModbusPacket(uint8_t *buf, int len);
-uint16_t ReadHoldingRegister(uint16_t address);
-
-#define RS485_TX_RE() HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET)
-#define RS485_RX_DE() HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET)
-
-
-#define MODBUS_MAX_LEN  256
-#define MODBUS_SLAVE_ID 0x01
-
-uint8_t tx_buf[MODBUS_MAX_LEN];
-uint8_t rx_buf[MODBUS_MAX_LEN];
-
-uint8_t tx_data[] = "RS485 DMA Packet\r\n";
-uint8_t rx_buffer[64];
-
-uint8_t rx_data[64];
-uint8_t rx_buffer[64];
-
-/* RS485 제어 핀 매크로 */
-//#define RS485_TX_ENABLE() HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET)
-//#define RS485_RX_ENABLE() HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET)
-
+// --- RS485 제어 매크로 ---
+// DE와 /RE 핀이 어떻게 연결되었는지 확인 필요.
+// 일반적으로 DE와 /RE를 묶어서 하나의 핀으로 제어하는 경우가 많음 (예: PB13)
+// 여기서는 DE(PB13), /RE(PB14) 개별 제어로 가정
 void RS485_TX_ENABLE() {
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+    // 전송 시작 전 DE High, /RE High (트랜시버에 따라 다를 수 있음, 데이터시트 확인!)
+    HAL_GPIO_WritePin(GPIOB, DE_Pin, GPIO_PIN_RESET);     // DE High
+    HAL_GPIO_WritePin(GPIOB, RE_Pin, GPIO_PIN_SET);     // /RE High (보통 DE와 반대거나 같음)
+    // 짧은 지연시간 (필요시)
+    // for(volatile int i=0; i<10; i++); // 매우 짧은 지연, 클럭 속도에 따라 조절
 }
 
 void RS485_RX_ENABLE() {
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+    // 전송 완료 후 또는 평상시 DE Low, /RE Low
+    // for(volatile int i=0; i<10; i++); // 전송 완료 보장 위한 짧은 지연 (필요시)
+    HAL_GPIO_WritePin(GPIOB, DE_Pin, GPIO_PIN_SET);   // DE Low
+    HAL_GPIO_WritePin(GPIOB, RE_Pin, GPIO_PIN_RESET);   // /RE Low
 }
 
-__weak void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
+// --- UART 수신 콜백 (Modbus T3.5 타이머 연동) ---
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
+        // 수신 버퍼 오버플로우 방지
+        if (ModbusReceiveIndex < MODBUS_BUFFER_SIZE) {
+            ModbusReceiveBuffer[ModbusReceiveIndex++] = UART1_RxBuffer;
 
-    	printf("HAL_UART_RxCpltCallback  \r\n");
-        // 수신된 데이터를 버퍼에 저장
-        ModbusReceiveBuffer[ModbusReceiveIndex++] = UART1_RxBuffer;
-
-        // 패킷 종료 조건 확인 (예: 일정 시간 내에 데이터가 수신되지 않으면 패킷 종료로 간주)
-        if (ModbusReceiveIndex >= EXPECTED_PACKET_LENGTH) {
-            // 패킷 처리 함수 호출
-            ProcessModbusPacket(ModbusReceiveBuffer, ModbusReceiveIndex);
-            ModbusReceiveIndex = 0;  // 인덱스 초기화
+            // T3.5 타이머 리셋 및 시작 (문자 수신 시마다 재시작)
+            __HAL_TIM_SET_COUNTER(&htim2, 0); // 카운터 초기화
+            HAL_TIM_Base_Start_IT(&htim2);    // 타이머 시작 (One Pulse Mode 권장)
+        } else {
+            // 버퍼 오버플로우 처리 (예: 인덱스 초기화)
+            ModbusReceiveIndex = 0;
+            // 에러 로그 등
         }
 
-        // 다음 바이트 수신 준비
+        // 다음 1 바이트 수신 준비
         HAL_UART_Receive_IT(&huart1, &UART1_RxBuffer, 1);
 
-    }else if (huart->Instance == USART2) {
-    	// 수신된 데이터를 버퍼에 저장
-		ModbusReceiveBuffer[ModbusReceiveIndex++] = UART1_RxBuffer;
+    }
+    // else if (huart->Instance == USART2) {
+    //     // USART2 수신 처리 (printf용이면 보통 불필요)
+    // }
+}
 
-		// 패킷 종료 조건 확인 (예: 일정 시간 내에 데이터가 수신되지 않으면 패킷 종료로 간주)
-		if (ModbusReceiveIndex >= EXPECTED_PACKET_LENGTH) {
-			// 패킷 처리 함수 호출
-			ProcessModbusPacket(ModbusReceiveBuffer, ModbusReceiveIndex);
-			ModbusReceiveIndex = 0;  // 인덱스 초기화
-		}
+// --- T3.5 타이머 인터럽트 콜백 ---
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM2) {
+        // T3.5 시간 동안 추가 수신이 없었음 -> 프레임 종료
+        HAL_TIM_Base_Stop_IT(&htim2); // 타이머 중지
 
-		HAL_UART_Receive_IT(&huart2, &UART1_RxBuffer, 1);
+        if (ModbusReceiveIndex > 0) { // 수신된 데이터가 있을 경우만
+             ModbusFrameReceived = true; // 메인 루프에서 처리하도록 플래그 설정
+        }
     }
 }
 
+// --- CRC 계산 함수 (기존 코드 유지) ---
 uint16_t ModbusCRC(uint8_t *buf, int len) {
     uint16_t crc = 0xFFFF;
     for (int pos = 0; pos < len; pos++) {
@@ -178,89 +194,161 @@ uint16_t ModbusCRC(uint8_t *buf, int len) {
             }
         }
     }
-    return crc;
+    // Modbus RTU는 LSB first, MSB last
+    // return crc; // 이대로 반환하면 LSB가 먼저 나옴
+     return (crc >> 8) | (crc << 8); // SWAP bytes for correct comparison/transmission
 }
 
+// --- Modbus 패킷 처리 함수 ---
 void ProcessModbusPacket(uint8_t *buf, int len) {
-    // CRC 확인
-    uint16_t crc = ModbusCRC(buf, len - 2);
-//    if (crc != (buf[len - 2] | (buf[len - 1] << 8))) {
-//        // CRC 오류 처리
-//        return;
-//    }
+    // 1. 최소 길이 확인 (SlaveID + FuncCode + CRC = 4 bytes)
+    if (len < 4) {
+        return; // 너무 짧은 패킷
+    }
 
-    // 슬레이브 주소 확인
+    // 2. 슬레이브 주소 확인
     uint8_t slaveAddress = buf[0];
     if (slaveAddress != SLAVE_ADDRESS) {
-        // 슬레이브 주소 불일치
-        return;
+        return; // 내 주소가 아님
     }
 
-    // 함수 코드 확인 및 처리
+    // 3. CRC 확인 (수정: CRC 체크 활성화 및 바이트 순서 고려)
+    uint16_t received_crc = (buf[len - 1] << 8) | buf[len - 2]; // MSB first in calculation
+    uint16_t calculated_crc = ModbusCRC(buf, len - 2);
+    // calculated_crc = (calculated_crc >> 8) | (calculated_crc << 8); // SWAP bytes
+
+    if (received_crc != calculated_crc) {
+         // CRC 오류 처리 (예: 에러 로그, 무시)
+         printf("CRC Error! Received: 0x%04X, Calculated: 0x4X\r\n", received_crc, calculated_crc);
+         return;
+    }
+
+
+    // 4. 함수 코드 확인 및 처리
     uint8_t functionCode = buf[1];
+    uint8_t response[MODBUS_BUFFER_SIZE]; // 응답 버퍼
+    int responseLength = 0;
+    uint16_t startAddress, numRegisters, regValue, writeValue, crc;
+
     switch (functionCode) {
-        case 0x03:  // Read Holding Registers
-            // 시작 주소 및 레지스터 수 읽기
-            uint16_t startAddress = (buf[2] << 8) | buf[3];
-            uint16_t numRegisters = (buf[4] << 8) | buf[5];
+        case 0x03: // Read Holding Registers
+            if (len != 8) return; // FC03 요청 길이는 8바이트
+            startAddress = (buf[2] << 8) | buf[3];
+            numRegisters = (buf[4] << 8) | buf[5];
 
-            // 응답 패킷 준비
-            uint8_t response[5 + 2 * numRegisters];
-            response[0] = slaveAddress;
-            response[1] = functionCode;
-            response[2] = numRegisters * 2;  // 바이트 수
-            for (int i = 0; i < numRegisters; i++) {
-            	uint16_t regValue = ReadHoldingRegister(startAddress + i);
-                response[3 + i * 2] = regValue >> 8;
-                response[4 + i * 2] = regValue & 0xFF;
+            // 주소 및 개수 유효성 검사 (예: ADC 배열 범위 확인)
+            if ((startAddress + numRegisters) > (sizeof(uwADCxConvertedValue) / sizeof(uwADCxConvertedValue[0]))) {
+                // 예외 처리: Illegal Data Address
+                response[0] = slaveAddress;
+                response[1] = functionCode | 0x80; // 예외 응답 코드
+                response[2] = 0x02; // 예외 코드: Illegal Data Address
+                responseLength = 3;
+            } else {
+                // 정상 응답 준비
+                response[0] = slaveAddress;
+                response[1] = functionCode;
+                response[2] = numRegisters * 2; // 바이트 수
+                responseLength = 3;
+                for (int i = 0; i < numRegisters; i++) {
+                    regValue = ReadHoldingRegister(startAddress + i);
+                    response[responseLength++] = regValue >> 8;   // MSB
+                    response[responseLength++] = regValue & 0xFF; // LSB
+                }
             }
-
-            // CRC 추가
-            crc = ModbusCRC(response, 3 + 2 * numRegisters);
-            response[3 + 2 * numRegisters] = crc & 0xFF;
-            response[4 + 2 * numRegisters] = crc >> 8;
-
-            // 응답 전송
-            HAL_UART_Transmit(&huart1, response, sizeof(response), HAL_MAX_DELAY);
             break;
 
-        // 다른 함수 코드 처리
+        case 0x06: // Write Single Register
+            if (len != 8) return; // FC06 요청 길이는 8바이트
+            startAddress = (buf[2] << 8) | buf[3]; // 레지스터 주소 (릴레이 번호)
+            writeValue = (buf[4] << 8) | buf[5];   // 쓸 값 (ON/OFF)
+
+            // 주소 유효성 검사 (1~4번 릴레이 가정)
+            if (startAddress < 1 || startAddress > 4) {
+                 // 예외 처리: Illegal Data Address
+                response[0] = slaveAddress;
+                response[1] = functionCode | 0x80;
+                response[2] = 0x02;
+                responseLength = 3;
+            } else {
+                 // 레지스터 쓰기 (실제 릴레이 제어)
+                 WriteSingleRegister(startAddress, writeValue);
+
+                 // 정상 응답 (요청을 그대로 반향)
+                 for(int i=0; i<len-2; i++) { // CRC 제외하고 복사
+                     response[i] = buf[i];
+                 }
+                 responseLength = len - 2; // CRC 제외 길이
+            }
+            break;
+
+        // --- 다른 필요한 Function Code 처리 추가 ---
+        case 0x10: // Write Multiple Registers
+             // ... 구현 ...
+             break;
+
+        default:
+            // 지원하지 않는 함수 코드 예외 처리
+            response[0] = slaveAddress;
+            response[1] = functionCode | 0x80;
+            response[2] = 0x01; // 예외 코드: Illegal Function
+            responseLength = 3;
+            break;
+    }
+
+    // 5. 응답 전송 (예외 또는 정상 응답)
+    if (responseLength > 0) {
+        crc = ModbusCRC(response, responseLength);
+        response[responseLength++] = crc & 0xFF;       // CRC LSB
+        response[responseLength++] = (crc >> 8) & 0xFF; // CRC MSB (ModbusCRC 함수 수정으로 인해 순서 변경됨)
+
+        RS485_TX_ENABLE(); // 송신 모드 설정
+        HAL_Delay(1); // DE 핀 안정화 시간 (필요시, 매우 짧게)
+        HAL_UART_Transmit(&huart1, response, responseLength, HAL_MAX_DELAY); // 블로킹 방식 전송
+
+        // HAL_UART_Transmit_IT 또는 HAL_UART_Transmit_DMA 사용 시 주의:
+        // 전송 완료 콜백(HAL_UART_TxCpltCallback)에서 RS485_RX_ENABLE() 호출 필요
+
+        // 전송 완료 후 수신 모드 설정 (블로킹 함수 뒤에 호출)
+        // 전송 버퍼가 비워지는 것을 기다리는 약간의 지연이 필요할 수 있음
+        while(HAL_UART_GetState(&huart1) != HAL_UART_STATE_READY); // 간단한 대기 (더 정확한 방법 고려)
+        RS485_RX_ENABLE();
     }
 }
 
-void SendResponsePacket(void)
-{
-	uint16_t crc = 0xff;
-	uint16_t numRegisters = 10;
-
-	// 응답 패킷 준비
-	uint8_t response[5 + 2 * numRegisters];
-	response[0] = 0x01;//slaveAddress;
-	response[1] = 0x10;//functionCode;
-	response[2] = numRegisters * 2;  // 바이트 수
-	for (int i = 0; i < numRegisters; i++) {
-		uint16_t regValue = uwADCxConvertedVals;
-	    response[3 + i * 2] = regValue >> 8;
-	    response[4 + i * 2] = regValue & 0xFF;
-	}
-
-	// CRC 추가
-	crc = ModbusCRC(response, 3 + 2 * numRegisters);
-	response[3 + 2 * numRegisters] = crc & 0xFF;
-	response[4 + 2 * numRegisters] = crc >> 8;
-
-	// 응답 전송
-	HAL_UART_Transmit(&huart1, response, sizeof(response), HAL_MAX_DELAY);
-}
-
+// --- Holding Register 읽기 함수 ---
 uint16_t ReadHoldingRegister(uint16_t address) {
-    // 실제 레지스터 읽기 로직을 여기에 추가
-    // 예제에서는 address에 따라 임의의 값을 반환
-
-	uint16_t regVal = 0;
-	regVal = uwADCxConvertedValue[address];
-    return regVal;
+    // 주소 유효성 검사 (0부터 시작하는 인덱스 가정)
+    if (address < (sizeof(uwADCxConvertedValue) / sizeof(uwADCxConvertedValue[0]))) {
+        return uwADCxConvertedValue[address];
+    }
+    // 다른 레지스터 영역 처리 (필요시)
+    return 0; // 잘못된 주소면 0 반환
 }
+
+// --- Single Register 쓰기 함수 (릴레이 제어) ---
+void WriteSingleRegister(uint16_t address, uint16_t value) {
+    GPIO_PinState pinState = (value == 0xFF00) ? GPIO_PIN_RESET : GPIO_PIN_SET; // 0xFF00: ON(LOW), 0x0000: OFF(HIGH) - 릴레이 특성에 맞게 조절
+
+    switch (address) {
+        case 1: // 릴레이 1 주소
+            HAL_GPIO_WritePin(RELAY1_PORT, RELAY1_PIN, pinState);
+            break;
+        case 2: // 릴레이 2 주소
+            HAL_GPIO_WritePin(RELAY2_PORT, RELAY2_PIN, pinState);
+            break;
+        case 3: // 릴레이 3 주소
+            HAL_GPIO_WritePin(RELAY3_PORT, RELAY3_PIN, pinState);
+            break;
+        case 4: // 릴레이 4 주소
+            HAL_GPIO_WritePin(RELAY4_PORT, RELAY4_PIN, pinState);
+            break;
+        default:
+            // 잘못된 주소
+            break;
+    }
+    // 다른 레지스터 영역 처리 (필요시)
+}
+
 
 /* USER CODE END 0 */
 
@@ -296,108 +384,90 @@ int main(void)
   MX_ADC1_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
+  MX_TIM2_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  // 초기 릴레이 상태 설정 (OFF)
+  HAL_GPIO_WritePin(RELAY1_PORT, RELAY1_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(RELAY2_PORT, RELAY2_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(RELAY3_PORT, RELAY3_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(RELAY4_PORT, RELAY4_PIN, GPIO_PIN_SET);
+
+  RS485_RX_ENABLE(); // 초기 상태는 수신 모드
+
+  // Modbus 수신 시작 (첫 1 바이트)
   HAL_UART_Receive_IT(&huart1, &UART1_RxBuffer, 1);
+
+  // ADC 설정
+  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK) {
+      Error_Handler();
+  }
+  // ADC 인터럽트 방식 사용 시 시작 (콜백에서 값 읽기)
+  // if (HAL_ADC_Start_IT(&hadc1) != HAL_OK) { Error_Handler(); }
+  // 또는 폴링 방식 사용 시 아래 루프 내에서 처리
+
+   uint16_t len = modbus_build_request(0x01, 0x0000, 0x0001, 1, tx_buf);
+   RS485_TX_ENABLE();
+   HAL_UART_Transmit(&huart1, tx_buf, len, 100);
+   HAL_Delay(1000);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET); // Relay Off
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET); // Relay Off
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET); // Relay Off
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET); // Relay Off
-
-  uint16_t len = modbus_build_request(0x01, 0x0000, 0x0001, 1, tx_buf);
-
-  RS485_TX_ENABLE();
-  HAL_UART_Transmit(&huart1, tx_buf, len, 100);
-  HAL_Delay(1000);
-
-  /* USER CODE BEGIN WHILE */
-
-  /* ### - 1 - Initialize ADC peripheral(CubeMX ?��?�� ?��?��) ##################### */
-
-  /* ### - 2 - Start calibration ############################################ */
-  if (HAL_ADCEx_Calibration_Start (&hadc1) != HAL_OK)
-  {
-	  Error_Handler ();
-  }
-
-  if (HAL_ADC_Start_IT (&hadc1) != HAL_OK)
-  {
-     Error_Handler ();
-  }
-
-
-  /* ### - 3 - Channel configuration (MX_ADC1_Init() 처리) ################### */
   while (1)
   {
-	  //	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-	  //	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-	  //
-	  //	  HAL_UART_Receive(&huart1, rx_buf, len, 100);
-	  //	  HAL_Delay(500);
-
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-//
-//	  HAL_UART_Transmit(&huart1, tx_buf, len, 100);
-//	  HAL_Delay(500);
-//
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-//	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-
-	 /* ### - 4 - Start the conversion process ################################*/
-	 if (HAL_ADC_Start (&hadc1) != HAL_OK)
-	  {
-		/* Start Conversation Error */
-		Error_Handler ();
-	  }
-
-	 for (uint8_t i = 0; i < 10; i++)
-	  {
-            /* ### - 5 - Wait for the end of conversion ############################*/
-            HAL_ADC_PollForConversion (&hadc1, 100);
-
-            /* Check if the continuous conversion of regular channel is finished */
-            if ((HAL_ADC_GetState (&hadc1) & HAL_ADC_STATE_REG_EOC) == HAL_ADC_STATE_REG_EOC)
-              {
-                /* ### - 6 - Get the converted value of regular channel ##############*/
-                uwADCxConvertedValue[i] = HAL_ADC_GetValue (&hadc1);
-              }
-          }
-
-        /* ### - 7 - Stop the conversion process #################################*/
-        HAL_ADC_Stop (&hadc1);
-        //HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-
-        // 500ms 마다 LED 토글
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // PA5 핀에 연결된 LED 제어 (핀 이름은 실제 설정에 맞게 변경)
-        HAL_Delay(500); // 500ms 지연
-
-
-        // 버튼(B1, 예를 들어 PC13)이 눌렸는지 확인 (Pull-up 저항 사용 가정, 누르면 LOW)
-		if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET)
-		{
-			printf("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\r\n", rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7] );
-			//HAL_UART_Transmit(&huart2, (uint8_t *)"Blue Button Pressed..\r\n", 23, HAL_MAX_DELAY);
-			//RS485_TX_ENABLE();
-			HAL_UART_Transmit(&huart2, &UART1_RxBuffer, 10, 100);
-			//HAL_Delay(500);
-
-			// 버튼 눌렸을 때 처리 (Debouncing은 추가 구현 필요)
-			HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET); // LED 켜기
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET); // Relay Off
-
-		}else {
-
-			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET); // Relay On
-		}
-
-        HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    // --- Modbus 프레임 처리 ---
+    if (ModbusFrameReceived) {
+        ProcessModbusPacket(ModbusReceiveBuffer, ModbusReceiveIndex);
+        ModbusReceiveIndex = 0;      // 인덱스 초기화
+        ModbusFrameReceived = false; // 플래그 리셋
+        // 수신 재시작 (ProcessModbusPacket 에서 송신 후 수신 모드로 전환하므로 불필요할 수 있음)
+        // 하지만 안전을 위해 추가 고려: HAL_UART_Receive_IT(&huart1, &UART1_RxBuffer, 1);
+    }
+
+
+    // --- ADC 값 읽기 (폴링 방식 예시) ---
+    // ADC 인터럽트 방식을 사용하면 이 부분은 필요 없음
+//	 HAL_ADC_Start(&hadc1);
+//	 for (uint8_t i = 0; i < (sizeof(uwADCxConvertedValue) / sizeof(uwADCxConvertedValue[0])); i++) {
+//		 // ADC 채널 변경 로직 필요 시 추가 (CubeMX에서 Scan 모드 설정 시 자동)
+//		 HAL_ADC_PollForConversion(&hadc1, 10); // 타임아웃 10ms
+//		 if ((HAL_ADC_GetState(&hadc1) & HAL_ADC_STATE_REG_EOC) == HAL_ADC_STATE_REG_EOC) {
+//			 uwADCxConvertedValue[i] = HAL_ADC_GetValue(&hadc1);
+//		 } else {
+//			 // ADC 읽기 오류 처리
+//		 }
+//	 }
+//	 HAL_ADC_Stop(&hadc1);
+
+	 HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // PA5 핀에 연결된 LED 제어 (핀 이름은 실제 설정에 맞게 변경)
+	 HAL_Delay(500); // 500ms 지연
+
+	 // 버튼(B1, 예를 들어 PC13)이 눌렸는지 확인 (Pull-up 저항 사용 가정, 누르면 LOW)
+	 if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET)
+	 {
+		 printf("Blue Button Pressed...\r\n");
+
+		// 버튼 눌렸을 때 처리 (Debouncing은 추가 구현 필요)
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET); // LED 켜기
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET); // Relay Off
+
+	 }else {
+
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET); // Relay On
+	 }
+
+
+    // --- 기타 작업 ---
+    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin); // LD2 토글 (하트비트)
+    HAL_Delay(500); // 메인 루프 지연 (다른 작업에 따라 조절)
+
   }
   /* USER CODE END 3 */
 }
@@ -448,184 +518,10 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC1_Init(void)
-{
-
-  /* USER CODE BEGIN ADC1_Init 0 */
-
-  /* USER CODE END ADC1_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC1_Init 1 */
-
-  /* USER CODE END ADC1_Init 1 */
-
-  /** Common config
-  */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC1_Init 2 */
-
-  /* USER CODE END ADC1_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 9600;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 9600;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, RE_Pin|DE_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : RE_Pin DE_Pin */
-  GPIO_InitStruct.Pin = RE_Pin|DE_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PC6 PC7 PC8 PC9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
 /* USER CODE BEGIN 4 */
 int _write(int file, char *ptr, int len)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart3, (uint8_t *)ptr, len, HAL_MAX_DELAY);
     return len;
 }
 
