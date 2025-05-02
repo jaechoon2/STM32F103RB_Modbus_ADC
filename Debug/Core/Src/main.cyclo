@@ -7,7 +7,7 @@
 ../Core/Src/main.c:203:6:ProcessModbusPacket	17
 ../Core/Src/main.c:319:10:ReadHoldingRegister	2
 ../Core/Src/main.c:329:6:WriteSingleRegister	5
-../Core/Src/main.c:359:5:main	4
+../Core/Src/main.c:359:5:main	6
 ../Core/Src/main.c:479:6:SystemClock_Config	4
 ../Core/Src/main.c:522:5:_write	1
 ../Core/Src/main.c:528:6:HAL_ADC_ConvCpltCallback	1

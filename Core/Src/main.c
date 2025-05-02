@@ -434,17 +434,17 @@ int main(void)
 
     // --- ADC 값 읽기 (폴링 방식 예시) ---
     // ADC 인터럽트 방식을 사용하면 이 부분은 필요 없음
-//	 HAL_ADC_Start(&hadc1);
-//	 for (uint8_t i = 0; i < (sizeof(uwADCxConvertedValue) / sizeof(uwADCxConvertedValue[0])); i++) {
-//		 // ADC 채널 변경 로직 필요 시 추가 (CubeMX에서 Scan 모드 설정 시 자동)
-//		 HAL_ADC_PollForConversion(&hadc1, 10); // 타임아웃 10ms
-//		 if ((HAL_ADC_GetState(&hadc1) & HAL_ADC_STATE_REG_EOC) == HAL_ADC_STATE_REG_EOC) {
-//			 uwADCxConvertedValue[i] = HAL_ADC_GetValue(&hadc1);
-//		 } else {
-//			 // ADC 읽기 오류 처리
-//		 }
-//	 }
-//	 HAL_ADC_Stop(&hadc1);
+	 HAL_ADC_Start(&hadc1);
+	 for (uint8_t i = 0; i < (sizeof(uwADCxConvertedValue) / sizeof(uwADCxConvertedValue[0])); i++) {
+		 // ADC 채널 변경 로직 필요 시 추가 (CubeMX에서 Scan 모드 설정 시 자동)
+		 HAL_ADC_PollForConversion(&hadc1, 10); // 타임아웃 10ms
+		 if ((HAL_ADC_GetState(&hadc1) & HAL_ADC_STATE_REG_EOC) == HAL_ADC_STATE_REG_EOC) {
+			 uwADCxConvertedValue[i] = HAL_ADC_GetValue(&hadc1);
+		 } else {
+			 // ADC 읽기 오류 처리
+		 }
+	 }
+	 HAL_ADC_Stop(&hadc1);
 
 	 HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // PA5 핀에 연결된 LED 제어 (핀 이름은 실제 설정에 맞게 변경)
 	 HAL_Delay(500); // 500ms 지연
